@@ -1,0 +1,2 @@
+*.tft filter=lfs diff=lfs merge=lfs -text
+*.HMI filter=lfs diff=lfs merge=lfs -text
