@@ -2,299 +2,284 @@
 #include <Arduino.h>
 #include <Preferences.h>
 
-namespace Winder {
+//
+//  Winder settings + Nextion helpers (header-only)
+//  Drop-in replacement for SettingsStore.h
+//
 
-// ---------- App settings & versions ----------
-static constexpr uint16_t SETTINGS_VERSION = 3;   // bump when struct layout changes
-static constexpr const char* NVS_NAMESPACE = "winder";
+namespace Winder
+{
 
-// Safer name to avoid clashes with any 'struct Profile' elsewhere.
-enum class PickupProfile : uint8_t { Strat=0, Tele=1, P90=2, Jazzmaster=3, Humbucker=4 };
+  // -------------------------
+  // Settings model
+  // -------------------------
+  struct Settings
+  {
+    uint32_t baseTurns;     // profile’s base turns (e.g. 8000)
+    uint16_t overwindTurns; // user extra turns (UI: nOverwind)
+    uint16_t maxRPM;        // UI: nRPM
+    uint16_t accel;         // UI: nAccel
+    bool dirCW;             // motor direction
+    uint8_t lastPage;       // optional (remember UI page)
+    uint8_t profileId;      // <-- add this
+  };
 
-// Persisted settings (stable order)
-struct Settings {
-  // identity / integrity
-  uint16_t version;
-  uint16_t size;       // sizeof(Settings) when saved
-  uint32_t crc32;
+  // -------------------------
+  // Robust NVS-backed store (per-field keys)
+  // - tolerant to struct changes (no raw blob, no CRC required)
+  // - bump kVersion if you add/change fields
+  // -------------------------
+  class SettingsStore
+  {
+  public:
+    SettingsStore() = default;
 
-  // Winding config
-  PickupProfile profile;      // pickup type
-  uint32_t      baseTurns;    // e.g. 8000
-  int32_t       bridgeOffsetTurns; // e.g. +200 for hotter bridge (can be negative)
-  float         overwindPct;  // e.g. 0..30 (%)
+    bool begin()
+    {
+      // Always open RW so saves actually write
+      return prefs.begin("winder", /*readOnly=*/false);
+    }
 
-  // Motion
-  uint16_t maxRPM;
-  uint16_t accel;             // your units
-  bool     dirCW;
+    // Defaults you want at first boot / reset-to-defaults
+    // Defaults you want at first boot / reset-to-defaults
+    void setDefaultsInRam()
+    {
+      s.baseTurns = 8000;
+      s.overwindTurns = 100; // (SAFE: 50..200)
+      s.maxRPM = 600;        // (SAFE: 300..1200)
+      s.accel = 800;         // CHANGED to fit 0..1000 (was 1200)
+      s.dirCW = true;
+      s.lastPage = 0;
+      s.profileId = 0;
+    }
 
-  // Cal/IO
-  float    vinCal;            // calibration scalar
-  float    rpmScale;          // rpm feedback scalar
+    // Returns true if settings are usable (seeds defaults on first run / version change)
+    // Returns true if settings are usable (seeds defaults on first run / version change)
+    bool load()
+    {
+      // Always seed RAM with your canonical defaults first
+      setDefaultsInRam();
 
-  // UI state (optional)
-  uint8_t  lastPage;
-};
+      const uint16_t ver = prefs.getUShort("ver", 0);
+      if (ver != kVersion)
+      {
+        // Persist the new schema defaults and we're done
+        return save();
+      }
 
-// ---------- Defaults ----------
-inline Settings makeDefaults() {
-  Settings s{};
-  s.version = SETTINGS_VERSION;
-  s.size    = sizeof(Settings);
-  s.crc32   = 0;
-
-  s.profile = PickupProfile::Strat;
-  s.baseTurns = 8000;
-  s.bridgeOffsetTurns = 0;
-  s.overwindPct = 0.0f;
-
-  s.maxRPM = 1200;
-  s.accel  = 600;
-  s.dirCW  = true;
-
-  s.vinCal = 1.0f;
-  s.rpmScale = 1.0f;
-
-  s.lastPage = 0;
-  return s;
-}
-
-// ---------- CRC32 (tiny, fast) ----------
-inline uint32_t crc32_update_(uint32_t crc, uint8_t data) {
-  crc ^= data;
-  for (uint8_t i=0;i<8;i++) crc = (crc>>1) ^ (0xEDB88320u & (-(int32_t)(crc & 1)));
-  return crc;
-}
-inline uint32_t crc32_calc_(const void* data, size_t len) {
-  const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
-  uint32_t crc = 0xFFFFFFFFu;
-  for (size_t i=0;i<len;i++) crc = crc32_update_(crc, p[i]);
-  return ~crc;
-}
-
-// ---------- Store wrapper (header-only) ----------
-class SettingsStore {
-public:
-  SettingsStore() : _prefs(), _settings(makeDefaults()) {}
-
-  bool begin() { return _prefs.begin(NVS_NAMESPACE, /*readOnly=*/false); }
-
-  const Settings& get() const { return _settings; }
-  Settings&       edit()      { return _settings; }
-
-  // Load with validation (version, size, CRC). Returns true if valid/migrated payload applied.
-  bool load() {
-    if (!_prefs.isKey("blob")) { _settings = makeDefaults(); return false; }
-
-    size_t sz = _prefs.getBytesLength("blob");
-    if (sz != sizeof(Settings)) { _settings = makeDefaults(); return false; }
-
-    Settings tmp{};
-    _prefs.getBytes("blob", &tmp, sizeof(Settings));
-
-    if (tmp.version != SETTINGS_VERSION || tmp.size != sizeof(Settings)) {
-      _settings = migrate_(tmp);   // graceful forward migration
-      save();                      // write back in new format
+      // Overlay stored values on top of defaults
+      s.baseTurns = prefs.getUInt("baseTurns", s.baseTurns);
+      s.overwindTurns = prefs.getUShort("overwindTurns", s.overwindTurns);
+      s.maxRPM = prefs.getUShort("maxRPM", s.maxRPM);
+      s.accel = prefs.getUShort("accel", s.accel);
+      s.dirCW = prefs.getBool("dirCW", s.dirCW);
+      s.lastPage = prefs.getUChar("lastPage", s.lastPage);
+      s.profileId = prefs.getUChar("profileId", s.profileId);
       return true;
     }
 
-    uint32_t expect = tmp.crc32;
-    tmp.crc32 = 0;
-    if (crc32_calc_(&tmp, sizeof(Settings)) != expect) {
-      _settings = makeDefaults();
-      return false;
+    // Persist current RAM copy to NVS
+    bool save()
+    {
+      clampToSafeRange_(); // sanitize before persisting
+
+      size_t ok = 0;
+      ok += prefs.putUShort("ver", kVersion) > 0;
+      ok += prefs.putUInt("baseTurns", s.baseTurns) > 0;
+      ok += prefs.putUShort("overwindTurns", s.overwindTurns) > 0;
+      ok += prefs.putUShort("maxRPM", s.maxRPM) > 0;
+      ok += prefs.putUShort("accel", s.accel) > 0;
+      ok += prefs.putBool("dirCW", s.dirCW) > 0;
+      ok += prefs.putUChar("lastPage", s.lastPage) > 0;
+      ok += prefs.putUChar("profileId", s.profileId) > 0;
+
+      return ok >= 8; // all fields written
     }
 
-    _settings = tmp;
-    return true;
-  }
+    // Reset RAM to defaults and persist
+    bool restoreDefaults()
+    {
+      setDefaultsInRam();
+      clampToSafeRange_(); // keep defaults within the safe ranges
+      return save();
+    }
 
-  // Save
-  bool save() {
-    Settings tmp = _settings;
-    tmp.version = SETTINGS_VERSION;
-    tmp.size    = sizeof(Settings);
-    tmp.crc32   = 0;
-    tmp.crc32   = crc32_calc_(&tmp, sizeof(Settings));
-    size_t w = _prefs.putBytes("blob", &tmp, sizeof(Settings));
-    return (w == sizeof(Settings));
-  }
+    // Access
+    Settings &edit() { return s; }
+    const Settings &get() const { return s; }
 
-  // Restore factory defaults
-  bool restoreDefaults() {
-    _settings = makeDefaults();
-    return save();
-  }
+  private:
+    static constexpr uint16_t kVersion = 2; // bump when you add/change fields
+    Preferences prefs;
+    Settings s{};
 
-private:
-  // Basic migration stub (extend if you add older layouts later)
-  static Settings migrate_(const Settings& /*oldAny*/) {
-    return makeDefaults();
-  }
+    static constexpr int RPM_MIN = 300, RPM_MAX = 1200;
+    static constexpr int ACC_MIN = 0, ACC_MAX = 1000;
+    static constexpr int OW_MIN = 50, OW_MAX = 200;
 
-  Preferences _prefs;
-  Settings    _settings;
-};
+    static inline int clampi_(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi
+                                                                                       : v; }
 
-// ---------- Nextion helpers (serial-agnostic, no F()+String concat) ----------
-namespace NX {
+    void clampToSafeRange_()
+    {
+      s.maxRPM = clampi_(s.maxRPM, RPM_MIN, RPM_MAX);
+      s.accel = clampi_(s.accel, ACC_MIN, ACC_MAX);
+      s.overwindTurns = clampi_(s.overwindTurns, OW_MIN, OW_MAX);
+      // baseTurns/dirCW/lastPage/profileId don’t need clamping
+    }
+  };
 
-static Stream* out = &Serial;                 // default to Serial until you setOut(&HMI)
-inline void setOut(Stream* s) { out = s; }
+  // -------------------------
+  // Nextion helpers (optional but handy)
+  // - keep these light; they’re harmless if a target doesn’t exist
+  // -------------------------
+  namespace NX
+  {
 
-static constexpr uint16_t COL_OK    = 2016;
-static constexpr uint16_t COL_WARN  = 64512;
-static constexpr uint16_t COL_BAD   = 63488;
-static constexpr uint16_t COL_MUTED = 33808;
-static constexpr uint16_t COL_FG    = 65535;
-static constexpr uint16_t COL_BG    = 0;
+    // Color palette (RGB565)
+    // tweak to your theme if desired
+    static constexpr uint16_t COL_TEXT = 65535; // white
+    static constexpr uint16_t COL_BG = 0;       // black
+    static constexpr uint16_t COL_OK = 2016;    // green
+    static constexpr uint16_t COL_BAD = 63488;  // red
 
-inline void sendTerminator() { out->write(0xFF); out->write(0xFF); out->write(0xFF); }
+    // Output UART for HMI
+    static HardwareSerial *out = nullptr;
 
-inline void ref(const String& obj) {
-  out->print(F("ref ")); out->print(obj); sendTerminator();
-}
-inline void cmd(const char* s) { out->print(s); sendTerminator(); }
-inline void cmd(const String& s){ out->print(s); sendTerminator(); }
+    inline void setOut(HardwareSerial *s) { out = s; }
 
-inline void setTxt(const String& obj, const String& txt) {
-  String safe = txt; safe.replace("\"","\\\"");
-  out->print(obj); out->print(F(".txt=\"")); out->print(safe); out->print('\"'); sendTerminator();
-}
-inline void setVal(const String& obj, int32_t v) {
-  out->print(obj); out->print(F(".val=")); out->print(v); sendTerminator();
-}
-inline void setFloat(const String& obj, float f, uint8_t dp=1) {
-  char buf[32]; dtostrf(f,0,dp,buf);
-  out->print(obj); out->print(F(".txt=\"")); out->print(buf); out->print('\"'); sendTerminator();
-}
-inline void setPco(const String& obj, uint16_t color) {
-  out->print(obj); out->print(F(".pco=")); out->print(color); sendTerminator();
-}
-inline void setBco(const String& obj, uint16_t color) {
-  out->print(obj); out->print(F(".bco=")); out->print(color); sendTerminator();
-}
-inline void vis(const String& obj, bool on) {
-  out->print(F("vis ")); out->print(obj); out->print(','); out->print(on ? 1 : 0); sendTerminator();
-}
-inline void pulseOk(const String& obj) { setBco(obj, COL_OK); ref(obj); }
-inline void markValid(const String& obj, bool ok) {
-  setPco(obj, ok ? COL_FG : COL_BAD);
-  setBco(obj, ok ? COL_BG : (COL_BAD - 256));
-  ref(obj);
-}
-inline void showSavedToast() {
-  setTxt(F("tToast"), F("Saved"));
-  setBco(F("gToast"), COL_OK);
-  vis(F("gToast"), true);
-  out->print(F("tmrToast.en=1")); sendTerminator();
-}
-inline void showErrorToast(const String& message) {
-  setTxt(F("tToast"), message);
-  setBco(F("gToast"), COL_BAD);
-  vis(F("gToast"), true);
-  out->print(F("tmrToast.en=1")); sendTerminator();
-}
-inline void setStartEnabled(bool en) {
-  out->print(F("bStart.en=")); out->print(en ? 1 : 0); sendTerminator();
-  setPco(F("bStart"), en ? COL_FG : COL_MUTED);
-  setBco(F("bStart"), en ? COL_OK : COL_MUTED);
-}
+    inline void term()
+    {
+      if (!out)
+        return;
+      out->write(0xFF);
+      out->write(0xFF);
+      out->write(0xFF);
+    }
 
-} // namespace NX
+    // Send raw command (RAM String)
+    inline void cmd(const String &s)
+    {
+      if (!out)
+        return;
+      out->print(s);
+      term();
+    }
+
+    // Send raw command (Flash string)
+    inline void cmd(const __FlashStringHelper *fs)
+    {
+      if (!out)
+        return;
+      out->print(fs);
+      term();
+    }
+
+    // Build "obj.val=123"
+    inline void setVal(const __FlashStringHelper *obj, uint32_t v)
+    {
+      if (!out)
+        return;
+      String s((const __FlashStringHelper *)obj);
+      s += F(".val=");
+      s += v;
+      cmd(s);
+    }
+
+    // Build "obj.txt="...""
+    inline void setTxt(const __FlashStringHelper *obj, const __FlashStringHelper *txt)
+    {
+      if (!out)
+        return;
+      String s((const __FlashStringHelper *)obj);
+      s += F(".txt=");
+      s += '\"';
+      s += String(txt);
+      s += '\"';
+      cmd(s);
+    }
+
+    // Build "obj.txt=" + RAM string
+    inline void setTxt(const __FlashStringHelper *obj, const String &txt)
+    {
+      if (!out)
+        return;
+      String s((const __FlashStringHelper *)obj);
+      s += F(".txt=");
+      s += '\"';
+      s += txt;
+      s += '\"';
+      cmd(s);
+    }
+
+    // Build "obj.bco=COLOR"
+    inline void setBco(const __FlashStringHelper *obj, uint32_t color)
+    {
+      if (!out)
+        return;
+      String s((const __FlashStringHelper *)obj);
+      s += F(".bco=");
+      s += color;
+      cmd(s);
+    }
+
+    // Build "obj.pco=COLOR"
+    inline void setPco(const __FlashStringHelper *obj, uint32_t color)
+    {
+      if (!out)
+        return;
+      String s((const __FlashStringHelper *)obj);
+      s += F(".pco=");
+      s += color;
+      cmd(s);
+    }
+
+    // Show/hide object
+    inline void vis(const __FlashStringHelper *obj, bool on)
+    {
+      if (!out)
+        return;
+      String s(F("vis "));
+      s += String(obj);
+      s += F(",");
+      s += (on ? F("1") : F("0"));
+      cmd(s);
+    }
+
+    // Quick validity tint (pco/bco + ref); harmless if object absent
+    inline void markValid(const __FlashStringHelper *name, bool ok)
+    {
+      Winder::NX::setPco(name, Winder::NX::COL_TEXT); // always readable text
+      Winder::NX::setBco(name, ok ? Winder::NX::COL_BG : Winder::NX::COL_BAD);
+      // optional: Winder::NX::ref(name);
+    }
+
+    // Start button enable/disable (optional; ignore if you don’t have bStart)
+    inline void setStartEnabled(bool on)
+    {
+      // If you have a dedicated style, tweak these two lines to your actual object
+      // They’re harmless if "bStart" doesn’t exist (with bkcmd=0)
+      String s1(F("bStart.bco="));
+      s1 += (on ? COL_OK : COL_BAD);
+      cmd(s1);
+      String s2(F("bStart.en="));
+      s2 += (on ? F("1") : F("0"));
+      cmd(s2);
+    }
+    inline void toastBoth(const __FlashStringHelper *msg, uint32_t color)
+    {
+      // page0
+      setTxt(F("page0.tToast"), String(msg));
+      setBco(F("page0.tToast"), color);
+      vis(F("page0.tToast"), true);
+      cmd(F("page0.tmrToast.en=1"));
+      // page1
+      setTxt(F("page1.tToast"), String(msg));
+      setBco(F("page1.tToast"), color);
+      vis(F("page1.tToast"), true);
+      cmd(F("page1.tmrToast.en=1"));
+    }
+
+  } // namespace NX
 
 } // namespace Winder
-
-
-
-
-// #pragma once
-// #include <Arduino.h>
-// #include <Preferences.h>
-
-// // ---------- Nextion helpers (serial-agnostic, no F()+String concat) ----------
-// //namespace NX {
-// namespace Winder {
-
-// struct Settings {            // <- present
-//   uint16_t version, size;
-//   uint32_t crc32;
-//   // ... (other fields incl. baseTurns, accel, dirCW)
-//   uint32_t baseTurns;
-//   uint16_t accel;
-//   bool     dirCW;
-//   // ...
-// };
-
-// class SettingsStore {        // <- present
-// public:
-//   SettingsStore();
-//   bool begin();
-//   bool load();
-//   bool save();
-//   bool restoreDefaults();
-//   const Settings& get() const;
-//   Settings&       edit();
-// private:
-//   // ...
-// };
-
-// static Stream* out = &Serial2;                 // default
-// inline void setOut(Stream* s) { out = s; }     // call this to use your HMI serial
-
-// static constexpr uint16_t COL_OK    = 2016;
-// static constexpr uint16_t COL_WARN  = 64512;
-// static constexpr uint16_t COL_BAD   = 63488;
-// static constexpr uint16_t COL_MUTED = 33808;
-// static constexpr uint16_t COL_FG    = 65535;
-// static constexpr uint16_t COL_BG    = 0;
-
-// inline void sendTerminator() { out->write(0xFF); out->write(0xFF); out->write(0xFF); }
-
-// inline void ref(const String& obj) { out->print(F("ref ")); out->print(obj); sendTerminator(); }
-// inline void cmd(const char* s)     { out->print(s); sendTerminator(); }
-// inline void cmd(const String& s)   { out->print(s); sendTerminator(); }
-
-// inline void setTxt(const String& obj, const String& txt) {
-//   String safe = txt; safe.replace("\"","\\\"");
-//   out->print(obj); out->print(F(".txt=\"")); out->print(safe); out->print('\"'); sendTerminator();
-// }
-// inline void setVal(const String& obj, int32_t v) {
-//   out->print(obj); out->print(F(".val=")); out->print(v); sendTerminator();
-// }
-// inline void setFloat(const String& obj, float f, uint8_t dp=1) {
-//   char buf[32]; dtostrf(f,0,dp,buf);
-//   out->print(obj); out->print(F(".txt=\"")); out->print(buf); out->print('\"'); sendTerminator();
-// }
-// inline void setPco(const String& obj, uint16_t color) { out->print(obj); out->print(F(".pco=")); out->print(color); sendTerminator(); }
-// inline void setBco(const String& obj, uint16_t color) { out->print(obj); out->print(F(".bco=")); out->print(color); sendTerminator(); }
-// inline void vis(const String& obj, bool on) { out->print(F("vis ")); out->print(obj); out->print(','); out->print(on ? 1 : 0); sendTerminator(); }
-
-// inline void pulseOk(const String& obj) { setBco(obj, COL_OK); ref(obj); }
-// inline void markValid(const String& obj, bool ok) {
-//   setPco(obj, ok ? COL_FG : COL_BAD);
-//   setBco(obj, ok ? COL_BG : (COL_BAD - 256));
-//   ref(obj);
-// }
-// inline void showSavedToast() {
-//   setTxt(F("tToast"), F("Saved"));
-//   setBco(F("gToast"), COL_OK);
-//   vis(F("gToast"), true);
-//   out->print(F("tmrToast.en=1")); sendTerminator();
-// }
-// inline void showErrorToast(const String& message) {
-//   setTxt(F("tToast"), message);
-//   setBco(F("gToast"), COL_BAD);
-//   vis(F("gToast"), true);
-//   out->print(F("tmrToast.en=1")); sendTerminator();
-// }
-// inline void setStartEnabled(bool en) {
-//   out->print(F("bStart.en=")); out->print(en ? 1 : 0); sendTerminator();
-//   setPco(F("bStart"), en ? COL_FG : COL_MUTED);
-//   setBco(F("bStart"), en ? COL_OK : COL_MUTED);
-// }
-
-// } // namespace NX
-
-
