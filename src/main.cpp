@@ -49,7 +49,8 @@ HardwareSerial HMI(2);
 static Winder::SettingsStore store;
 
 // (Optional) helper: send the Nextion 0xFF terminator three times
-static inline void nxTerm()
+static inline void nxTerm()   // TODO: review Copilot note about X after v2b-stable
+
 {
   for (int i = 0; i < 3; i++)
     HMI.write(0xFF);
@@ -78,7 +79,8 @@ static void printSettings(const Winder::Settings &s)
 }
 
 static void pushSettingsToHMI(const Winder::Settings &s)
-{
+{   // TODO: review Copilot note about X after v2b-stable
+
   // If you have these objects in HMI, this will update them.
   // If not, harmless no-ops on Nextion (it just ignores unknown objects).
   Winder::NX::setVal(F("nBaseTurns"), s.baseTurns);
@@ -91,7 +93,8 @@ static void pushSettingsToHMI(const Winder::Settings &s)
   Winder::NX::setVal(F("cb0Profile"), s.profileId);
 }
 
-static String nxBuf;
+static String nxBuf;    // TODO: review Copilot note about X after v2b-stable
+
 static uint8_t nxFF = 0;
 static String pendingSetKey; // remembers "SET key" waiting for its value
 
@@ -100,7 +103,8 @@ static long parseIntSafe(const String &s)
   String d;
   d.reserve(s.length());
   for (size_t i = 0; i < s.length(); ++i)
-  {
+  {   // TODO: review Copilot note about X after v2b-stable
+
     char c = s[i];
     if ((c >= '0' && c <= '9') || (c == '-' && d.length() == 0))
       d += c;
@@ -200,7 +204,8 @@ static void handleNextionMessage(const String &msg)
     pendingSetKey = "";
     applyKV(key, val);
     return;
-  }
+  }   // TODO: review Copilot note about X after v2b-stable
+
 
   // 3) fresh "SET key" or "SET key value"
   if (m.startsWith("SET "))
@@ -228,9 +233,9 @@ static void handleNextionMessage(const String &msg)
   {
     bool ok = store.save();
     if (ok)
-      repaintAllPagesFromSettings();
-    Winder::NX::toastBoth(ok ? F("Saved") : F("Save failed"),
-                          ok ? Winder::NX::COL_OK : Winder::NX::COL_BAD);
+    repaintAllPagesFromSettings();
+    // Winder::NX::toastBoth(ok ? F("Saved") : F("Save failed"),
+    //                       ok ? Winder::NX::COL_OK : Winder::NX::COL_BAD);
     return;
   }
 
@@ -240,8 +245,8 @@ static void handleNextionMessage(const String &msg)
     bool ok = store.restoreDefaults();
     store.load();                  // belt & braces
     repaintAllPagesFromSettings(); // update page0 immediately
-    Winder::NX::toastBoth(ok ? F("Defaults restored") : F("Reset failed"),
-                          ok ? Winder::NX::COL_OK : Winder::NX::COL_BAD);
+    // Winder::NX::toastBoth(ok ? F("Defaults restored") : F("Reset failed"),
+    //                       ok ? Winder::NX::COL_OK : Winder::NX::COL_BAD);
     return;
   }
 }
@@ -286,7 +291,8 @@ void setup()
   Serial.println();
   Serial.println(F("Winder (PIO clean baseline + NVS) booting..."));
 
-  // Nextion / HMI serial (adjust pins if needed)
+  // Nextion / HMI serial (adjust pins if needed)   // TODO: review Copilot note about X after v2b-stable
+
   // If you wired custom pins, use: HMI.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
   HMI.begin(115200, SERIAL_8N1, /*RX=*/13, /*TX=*/14);
   // Point the Nextion helper output at your HMI serial
