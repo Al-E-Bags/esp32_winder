@@ -42,6 +42,24 @@ static inline bool allValid()
   return v_overwind && v_rpm && v_accel;
 }
 
+static bool NX_VERBOSE = false;
+
+// === PATCH 3A-LITE: Simulated Live RPM (until tacho is wired) ===
+static int rpmSim = 0;
+static uint32_t rpmSimLastMs = 0;
+
+// Helper to push to both pages safely
+static inline void pushRpmToHMI_(int rpm)
+{
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d", rpm);
+  // Use your existing NX helpers (page-qualified component names are OK)
+  Winder::NX::setTxt(F("page0.tRpm"), buf);
+  Winder::NX::setTxt(F("page1.tRpm"), buf);
+}
+
+// === /PATCH 3A-LITE ===
+
 // Your Nextion port (keep this name; we’ll route helpers to it)
 HardwareSerial HMI(2);
 
@@ -49,7 +67,7 @@ HardwareSerial HMI(2);
 static Winder::SettingsStore store;
 
 // (Optional) helper: send the Nextion 0xFF terminator three times
-static inline void nxTerm()   // TODO: review Copilot note about X after v2b-stable
+static inline void nxTerm() // TODO: review Copilot note about X after v2b-stable
 
 {
   for (int i = 0; i < 3; i++)
@@ -71,6 +89,16 @@ static void nx(const char *fmt, ...)
 // Simple heartbeat
 static uint32_t lastBeat = 0;
 
+// globals (near the top)
+// Heartbeat controls
+static bool HB_ENABLE = true; // default ON
+static uint32_t hbLast = 0;
+static constexpr uint32_t HB_PERIOD_MS = 1000; // <-- 1s heartbeat
+
+// Consider HMI "online" if we saw a valid frame recently
+static uint32_t nxLastRx = 0;
+static constexpr uint32_t NX_ONLINE_TIMEOUT_MS = 5000; // 5s without HMI -> offline
+
 static void printSettings(const Winder::Settings &s)
 {
   Serial.printf("Settings: baseTurns=%u, accel=%u, dirCW=%s, lastPage=%u\n",
@@ -79,7 +107,7 @@ static void printSettings(const Winder::Settings &s)
 }
 
 static void pushSettingsToHMI(const Winder::Settings &s)
-{   // TODO: review Copilot note about X after v2b-stable
+{ // TODO: review Copilot note about X after v2b-stable
 
   // If you have these objects in HMI, this will update them.
   // If not, harmless no-ops on Nextion (it just ignores unknown objects).
@@ -93,7 +121,7 @@ static void pushSettingsToHMI(const Winder::Settings &s)
   Winder::NX::setVal(F("cb0Profile"), s.profileId);
 }
 
-static String nxBuf;    // TODO: review Copilot note about X after v2b-stable
+static String nxBuf; // TODO: review Copilot note about X after v2b-stable
 
 static uint8_t nxFF = 0;
 static String pendingSetKey; // remembers "SET key" waiting for its value
@@ -103,7 +131,7 @@ static long parseIntSafe(const String &s)
   String d;
   d.reserve(s.length());
   for (size_t i = 0; i < s.length(); ++i)
-  {   // TODO: review Copilot note about X after v2b-stable
+  { // TODO: review Copilot note about X after v2b-stable
 
     char c = s[i];
     if ((c >= '0' && c <= '9') || (c == '-' && d.length() == 0))
@@ -142,6 +170,34 @@ static void applyKV(const String &key, long val)
     s.lastPage = (uint8_t)val;
   }
   // add other keys here as needed
+}
+
+static inline void heartbeatTick()
+{
+  const uint32_t now = millis();
+  if (now - hbLast < HB_PERIOD_MS)
+    return;
+  hbLast = now;
+
+  const bool nx_online = (now - nxLastRx) < NX_ONLINE_TIMEOUT_MS;
+  if (HB_ENABLE && nx_online)
+  {
+    Serial.printf("[HB] %lu ms\n", (unsigned long)now);
+  }
+}
+
+// Keep only printable ASCII + space; drop NULs and control chars
+static void nxSanitize_(String &s)
+{
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ++i)
+  {
+    unsigned char c = (unsigned char)s[i];
+    if (c == ' ' || (c >= 32 && c <= 126))
+      out += (char)c; // keep printable + space
+  }
+  s = out;
 }
 
 static void refreshValidationAndUIFromSettings()
@@ -188,13 +244,87 @@ static void repaintAllPagesFromSettings()
   Winder::NX::markValid(F("page0.nAccel"), ok_acc);
 
   Winder::NX::setStartEnabled(ok_over && ok_rpm && ok_acc);
+
+  {
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "page1.cbMoProfile.val=%u", (unsigned)store.get().profileId);
+    Winder::NX::cmd(cmd);
+  }
+}
+
+// Call this periodically to animate live RPM toward the target
+static void updateSimRpmAndPush()
+{
+  const uint32_t now = millis();
+  if (rpmSimLastMs == 0)
+  {
+    rpmSimLastMs = now;
+    return;
+  }
+  uint32_t dtMs = now - rpmSimLastMs;
+  if (dtMs < 150)
+    return; // ~6–7 Hz update; avoids spamming Nextion
+  rpmSimLastMs = now;
+
+  const auto &s = store.get();
+  const int target = s.maxRPM; // user target (from nRPM)
+  const int accel = s.accel;   // units-per-second; we’ll treat as RPM/s here
+
+  // How much we can change this tick: step = accel * dt
+  int step = (int)((accel * (float)dtMs) / 1000.0f);
+  if (step < 1)
+    step = 1; // always make progress
+
+  if (rpmSim < target)
+    rpmSim = (rpmSim + step <= target) ? rpmSim + step : target;
+  else if (rpmSim > target)
+    rpmSim = (rpmSim - step >= target) ? rpmSim - step : target;
+
+  pushRpmToHMI_(rpmSim);
+
+  // (Optional) color hint when at/near target
+  const bool onTarget = abs(rpmSim - target) <= 25; // +/- 25 RPM band
+  if (onTarget)
+  {
+    Winder::NX::cmd(F("page0.tRpm.pco=2016")); // green
+    Winder::NX::cmd(F("page1.tRpm.pco=2016"));
+  }
+  else
+  {
+    Winder::NX::cmd(F("page0.tRpm.pco=0")); // black
+    Winder::NX::cmd(F("page1.tRpm.pco=0"));
+  }
 }
 
 // ---------- full parser ----------
 static void handleNextionMessage(const String &msg)
 {
   String m = msg;
+  nxSanitize_(m); // <— remove NUL/control
   m.trim();
+  if (!m.length())
+    return; // became empty after sanitize
+
+  // (optional) allow-list to drop random text
+  bool ok =
+      m.startsWith("SET ") ||
+      m.equalsIgnoreCase("SAVE") || m.equalsIgnoreCase("CMD SAVE") ||
+      m.equalsIgnoreCase("RESET") || m.equalsIgnoreCase("CMD RESET") ||
+      m.equalsIgnoreCase("HB ON") || m.equalsIgnoreCase("HB OFF");
+  if (!ok)
+    return;
+
+  // Heartbeat toggles (now will match)
+  if (m == "HB ON")
+  {
+    HB_ENABLE = true;
+    return;
+  }
+  if (m == "HB OFF")
+  {
+    HB_ENABLE = false;
+    return;
+  }
 
   // 2) value-only message for a prior "SET key"
   if (pendingSetKey.length())
@@ -204,8 +334,7 @@ static void handleNextionMessage(const String &msg)
     pendingSetKey = "";
     applyKV(key, val);
     return;
-  }   // TODO: review Copilot note about X after v2b-stable
-
+  } // TODO: review Copilot note about X after v2b-stable
 
   // 3) fresh "SET key" or "SET key value"
   if (m.startsWith("SET "))
@@ -233,7 +362,7 @@ static void handleNextionMessage(const String &msg)
   {
     bool ok = store.save();
     if (ok)
-    repaintAllPagesFromSettings();
+      repaintAllPagesFromSettings();
     // Winder::NX::toastBoth(ok ? F("Saved") : F("Save failed"),
     //                       ok ? Winder::NX::COL_OK : Winder::NX::COL_BAD);
     return;
@@ -258,14 +387,38 @@ static void pollHMI()
   {
     int b = HMI.read();
 
+    // PATCH: drop NUL/control noise early
+    if (b == 0x00)
+    {
+      continue; // ignore 0x00 frames
+    }
+
     if (b == 0xFF)
     {
       if (++nxFF >= 3)
       {
         if (nxBuf.length() > 0)
         {
-          Serial.print(F("[NX] "));
-          Serial.println(nxBuf);
+          // PATCH: log only printable frames (keeps console clean)
+          bool printable = true;
+          for (size_t i = 0; i < nxBuf.length(); ++i)
+          {
+            char c = nxBuf[i];
+            if (c != '\r' && c != '\n' && (c < 32 || c > 126))
+            {
+              printable = false;
+              break;
+            }
+          }
+          if (printable)
+          {
+            if (NX_VERBOSE && printable)
+            {
+              Serial.print(F("[NX] "));
+              Serial.println(nxBuf);
+            }
+          }
+          nxLastRx = millis();
           handleNextionMessage(nxBuf); // your existing parser
         }
         nxBuf = "";
@@ -275,7 +428,16 @@ static void pollHMI()
     else
     {
       nxFF = 0;
-      nxBuf += char(b);
+
+      // PATCH: cap frame length to avoid garbage floods during power-down
+      if (nxBuf.length() < 80)
+      { // adjust 80 if you want
+        nxBuf += char(b);
+      }
+      else
+      {
+        nxBuf = ""; // too long -> discard this frame
+      }
     }
   }
 }
@@ -299,7 +461,7 @@ void setup()
   Winder::NX::setOut(&HMI);
   Winder::NX::vis(F("tToast"), false);
 
-  Winder::NX::cmd("bkcmd=3");
+  Winder::NX::cmd("bkcmd=0");
 
   Winder::NX::setStartEnabled(false); // show Start as disabled/gray at boot
   // (Optional) also tint the nBase field as “needs attention” on boot:
@@ -327,6 +489,17 @@ void setup()
   Winder::NX::markValid(F("nRPM"), false);
   Winder::NX::markValid(F("nAccel"), false);
   Winder::NX::setStartEnabled(false);
+  // --- after HMI init and after store.load(), still inside setup() ---
+  if (HB_ENABLE)
+  {
+    Winder::NX::cmd(F("page1.btHb.val=1"));
+    Winder::NX::cmd(F("page1.btHb.txt=\"HB ON\""));
+  }
+  else
+  {
+    Winder::NX::cmd(F("page1.btHb.val=0"));
+    Winder::NX::cmd(F("page1.btHb.txt=\"HB OFF\""));
+  }
 
   Serial.println(F("Setup complete."));
 }
@@ -337,38 +510,26 @@ void loop()
   const uint32_t now = millis();
 
   // Heartbeat every 1s
-  if (now - lastBeat >= 1000)
+  // if (now - lastBeat >= 1000)
+  // {
+  //   lastBeat = now;
+  //   Serial.printf("[HB] %lu ms\n", (unsigned long)now);
+  // }
+
+  if (millis() - hbLast >= HB_PERIOD_MS)
   {
-    lastBeat = now;
-    Serial.printf("[HB] %lu ms\n", (unsigned long)now);
+    hbLast = millis();
+    if (HB_ENABLE)
+      Serial.printf("[HB] %lu ms\n", (unsigned long)hbLast);
   }
 
-  // Read Nextion bytes, detect 0xFF 0xFF 0xFF terminator, parse "print ..." strings
-  while (HMI.available())
-  {
-    int b = HMI.read();
-    Serial.write(b); // echo raw for debugging
+  updateSimRpmAndPush();
 
-    if (b == 0xFF)
-    {
-      if (++nxFF >= 3)
-      {
-        if (nxBuf.length() > 0)
-        {
-          Serial.print(F("[NX] "));
-          Serial.println(nxBuf);
-          handleNextionMessage(nxBuf);
-        }
-        nxBuf = "";
-        nxFF = 0;
-      }
-    }
-    else
-    {
-      nxFF = 0;
-      nxBuf += (char)b;
-    }
-  }
+  pollHMI();             // this will assemble frames & call handleNextionMessage()
+  updateSimRpmAndPush(); // (your other periodic tasks)
+
+  heartbeatTick(); // <-- the ONLY heartbeat printer now
+
   // --- USB Serial commands: b(+100 baseTurns), s(save), r(factory reset), t(toast test) ---
   while (Serial.available())
   {
