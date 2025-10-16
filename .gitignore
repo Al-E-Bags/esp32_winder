@@ -1,11 +1,19 @@
+# PlatformIO / build artifacts
 .pio/
-.vscode/.browse.c_cpp.db*
-.vscode/ipch
-*.bin
 *.elf
+*.bin
 *.map
-*.tft
-*.tft.json
-*.DS_Store
+*.log
+
+# VS Code caches
+.vscode/.browse.VC.db*
+.vscode/ipch/
+
+# OS junk
+.DS_Store
 Thumbs.db
+
+# Nextion compiled outputs (keep .hmi only)
+*.tft
+
 
