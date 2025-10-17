@@ -13,23 +13,23 @@
 */
 
 #include <Arduino.h>
-#include "SettingsStore.h"
-#include <FastAccelStepper.h>
+#include "SettingsStore.h" // header-only; no .cpp needed
 
-static void motorStartSimple();
-static void motorStopSimple();
+// ----------------------------------------------------------------------------
+// Minimal, compile-now baseline using your existing HardwareSerial HMI(2)
+// ----------------------------------------------------------------------------
 
-// Validation flags (start false until fields are valid)
+// Validation flags (start false so Start is gray until fields are valid)
 static bool v_overwind = false;
 static bool v_rpm = false;
 static bool v_accel = false;
-static bool NX_VERBOSE = false;
 
-// Tweak these to the machine’s safe limits
+// Tweak these to your machine’s safe limits
 static constexpr int32_t RPM_MIN = 300;
 static constexpr int32_t RPM_MAX = 1000;
 static constexpr int32_t ACC_MIN = 50;
 static constexpr int32_t ACC_MAX = 1200;
+
 static constexpr int32_t OVER_MIN = 0;
 static constexpr int32_t OVER_MAX = 150;
 
@@ -42,58 +42,106 @@ static inline bool allValid()
   return v_overwind && v_rpm && v_accel;
 }
 
-// --- TB6600 pins (common-anode wiring) ---
-static constexpr uint8_t PIN_STEP = 9; // -> TB6600 PUL-  (PUL+ to +5V)
-static constexpr uint8_t PIN_DIR = 10; // -> TB6600 DIR-  (DIR+ to +5V)
-static constexpr uint8_t PIN_EN = 11;  // -> TB6600 ENBL- (ENBL+ to +5V)
+static bool NX_VERBOSE = false;
 
-// Mechanics (½-step per your DIP)
-static constexpr uint16_t MOTOR_STEPS_PER_REV = 200;
-static constexpr uint8_t MICROSTEP = 2; // DIP = half-step
-static constexpr uint32_t STEPS_PER_REV = (uint32_t)MOTOR_STEPS_PER_REV * MICROSTEP;
+// === PATCH 3A-LITE: Simulated Live RPM (until tacho is wired) ===
+static int rpmSim = 0;
+static uint32_t rpmSimLastMs = 0;
 
-static FastAccelStepperEngine engine;
-static FastAccelStepper *fas = nullptr;
-
-// Conversions (RPM & RPM/s -> FAS units)
-static inline uint32_t rpm_to_sps(uint16_t rpm)
+// Helper to push to both pages safely
+static inline void pushRpmToHMI_(int rpm)
 {
-  return (uint32_t)((rpm * (float)STEPS_PER_REV) / 60.0f);
-}
-static inline uint32_t accel_to_sps2(uint16_t accel_rpm_per_s)
-{
-  return (uint32_t)(((float)accel_rpm_per_s * (float)STEPS_PER_REV) / 60.0f);
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%d", rpm);
+  // Use your existing NX helpers (page-qualified component names are OK)
+  Winder::NX::setTxt(F("page0.tRpm"), buf);
+  Winder::NX::setTxt(F("page1.tRpm"), buf);
 }
 
+// === /PATCH 3A-LITE ===
 
-//=== UI FEEDBACK (toast/heartbeat) ======================================
+// Your Nextion port (keep this name; we’ll route helpers to it)
+HardwareSerial HMI(2);
 
+// Global NVS store
+static Winder::SettingsStore store;
+
+// (Optional) helper: send the Nextion 0xFF terminator three times
+static inline void nxTerm() // TODO: review Copilot note about X after v2b-stable
+
+{
+  for (int i = 0; i < 3; i++)
+    HMI.write(0xFF);
+}
+
+// (Optional) helper: formatted Nextion command print
+static void nx(const char *fmt, ...)
+{
+  char buf[128];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  HMI.print(buf);
+  nxTerm();
+}
+
+// Simple heartbeat
 static uint32_t lastBeat = 0;
+
+// globals (near the top)
+// Heartbeat controls
 static bool HB_ENABLE = true; // default ON
 static uint32_t hbLast = 0;
-static uint32_t nxLastRx = 0;                          // Consider HMI "online" if we saw a valid frame recently
-static constexpr uint32_t HB_PERIOD_MS = 1000;         // <-- 1s heartbeat
+static constexpr uint32_t HB_PERIOD_MS = 1000; // <-- 1s heartbeat
+
+// Consider HMI "online" if we saw a valid frame recently
+static uint32_t nxLastRx = 0;
 static constexpr uint32_t NX_ONLINE_TIMEOUT_MS = 5000; // 5s without HMI -> offline
 
-static inline void heartbeatTick()
+static void printSettings(const Winder::Settings &s)
 {
-  const uint32_t now = millis();
-  if (now - hbLast < HB_PERIOD_MS)
-    return;
-  hbLast = now;
-
-  const bool nx_online = (now - nxLastRx) < NX_ONLINE_TIMEOUT_MS;
-  if (HB_ENABLE && nx_online)
-  {
-    Serial.printf("[HB] %lu ms\n", (unsigned long)now);
-  }
+  Serial.printf("Settings: baseTurns=%u, accel=%u, dirCW=%s, lastPage=%u\n",
+                (unsigned)s.baseTurns, (unsigned)s.accel,
+                s.dirCW ? "true" : "false", (unsigned)s.lastPage);
 }
 
-//=== /UI FEEDBACK (toast/heartbeat) ======================================
-//=== SETTINGS (NVS/plumbing) ============================================
+static void pushSettingsToHMI(const Winder::Settings &s)
+{ // TODO: review Copilot note about X after v2b-stable
 
-static Winder::SettingsStore store;              // Global NVS store
-static void applyKV(const String &key, long val) // Update the store's RAM copy from a "SET key value"
+  // If you have these objects in HMI, this will update them.
+  // If not, harmless no-ops on Nextion (it just ignores unknown objects).
+  Winder::NX::setVal(F("nBaseTurns"), s.baseTurns);
+  Winder::NX::setVal(F("nAccel"), s.accel);
+  Winder::NX::setVal(F("nRPM"), s.maxRPM);
+  Winder::NX::setTxt(F("tDir"), s.dirCW ? F("CW") : F("CCW"));
+  Winder::NX::cmd(String(F("cb0Profile.val=")) + s.profileId);
+
+  // If you have a profile dropdown (cb0Profile):
+  Winder::NX::setVal(F("cb0Profile"), s.profileId);
+}
+
+static String nxBuf; // TODO: review Copilot note about X after v2b-stable
+
+static uint8_t nxFF = 0;
+static String pendingSetKey; // remembers "SET key" waiting for its value
+
+static long parseIntSafe(const String &s)
+{
+  String d;
+  d.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ++i)
+  { // TODO: review Copilot note about X after v2b-stable
+
+    char c = s[i];
+    if ((c >= '0' && c <= '9') || (c == '-' && d.length() == 0))
+      d += c;
+  }
+  return d.length() ? d.toInt() : 0;
+}
+
+// Update the store's RAM copy from a "SET key value"
+static void applyKV(const String &key, long val)
 {
   Winder::Settings &s = store.edit(); // <-- write into the store
 
@@ -124,11 +172,32 @@ static void applyKV(const String &key, long val) // Update the store's RAM copy 
   // add other keys here as needed
 }
 
-static void printSettings(const Winder::Settings &s)
+static inline void heartbeatTick()
 {
-  Serial.printf("Settings: baseTurns=%u, accel=%u, dirCW=%s, lastPage=%u\n",
-                (unsigned)s.baseTurns, (unsigned)s.accel,
-                s.dirCW ? "true" : "false", (unsigned)s.lastPage);
+  const uint32_t now = millis();
+  if (now - hbLast < HB_PERIOD_MS)
+    return;
+  hbLast = now;
+
+  const bool nx_online = (now - nxLastRx) < NX_ONLINE_TIMEOUT_MS;
+  if (HB_ENABLE && nx_online)
+  {
+    Serial.printf("[HB] %lu ms\n", (unsigned long)now);
+  }
+}
+
+// Keep only printable ASCII + space; drop NULs and control chars
+static void nxSanitize_(String &s)
+{
+  String out;
+  out.reserve(s.length());
+  for (size_t i = 0; i < s.length(); ++i)
+  {
+    unsigned char c = (unsigned char)s[i];
+    if (c == ' ' || (c >= 32 && c <= 126))
+      out += (char)c; // keep printable + space
+  }
+  s = out;
 }
 
 static void refreshValidationAndUIFromSettings()
@@ -152,80 +221,6 @@ static void refreshValidationAndUIFromSettings()
 
   // Start button state
   Winder::NX::setStartEnabled(allValid());
-}
-
-//=== /SETTINGS (NVS/plumbing) ============================================
-//=== MOTOR (FastAccelStepper) ============================================
-
-static inline int32_t turns_to_steps(float turns)
-{
-  return (int32_t)lroundf(turns * (float)STEPS_PER_REV);
-}
-
-// Align direction + speed/accel to current settings
-static void applyMotionFromSettings_()
-{
-  if (!fas)
-    return;
-  const auto &s = store.get();
-
-  // If on-screen CW runs the wrong way, flip the 'dirHighCountsUp' below to !s.dirCW
-  const bool dirHighCountsUp = s.dirCW;
-  fas->setDirectionPin(PIN_DIR, dirHighCountsUp);
-
-  fas->setSpeedInHz(rpm_to_sps(s.maxRPM));
-  fas->setAcceleration(accel_to_sps2(s.accel));
-}
-
-static void motorStartSimple()
-{
-  if (!fas)
-    return;
-  applyMotionFromSettings_();
-
-  const auto &s = store.get();
-  const float totalTurns = (float)s.baseTurns + (float)s.overwindTurns;
-  fas->moveTo(turns_to_steps(totalTurns));
-
-  Winder::NX::cmd(F("page0.tToast.txt=\"Running\""));
-  Winder::NX::cmd(F("vis page0.tToast,1"));
-  Winder::NX::cmd(F("page0.tmrToast.en=1"));
-  Winder::NX::cmd(F("page1.tToast.txt=\"Running\""));
-  Winder::NX::cmd(F("vis page1.tToast,1"));
-  Winder::NX::cmd(F("page1.tmrToast.en=1"));
-}
-
-static void motorStopSimple()
-{
-  if (!fas)
-    return;
-  fas->forceStopAndNewPosition(fas->getCurrentPosition()); // HARD stop
-  Winder::NX::cmd(F("page0.tToast.txt=\"Stopped\""));
-  Winder::NX::cmd(F("vis page0.tToast,1"));
-  Winder::NX::cmd(F("page0.tmrToast.en=1"));
-  Winder::NX::cmd(F("page1.tToast.txt=\"Stopped\""));
-  Winder::NX::cmd(F("vis page1.tToast,1"));
-  Winder::NX::cmd(F("page1.tmrToast.en=1"));
-}
-
-//=== /MOTOR (FastAccelStepper) ============================================
-//=== HMI PUSH (helpers -> Nextion) ======================================
-
-HardwareSerial HMI(2); // Nextion port (route helpers to it)
-
-static void pushSettingsToHMI(const Winder::Settings &s)
-{ // TODO: review Copilot note about X after v2b-stable
-
-  // If you have these objects in HMI, this will update them.
-  // If not, harmless no-ops on Nextion (it just ignores unknown objects).
-  Winder::NX::setVal(F("nBaseTurns"), s.baseTurns);
-  Winder::NX::setVal(F("nAccel"), s.accel);
-  Winder::NX::setVal(F("nRPM"), s.maxRPM);
-  Winder::NX::setTxt(F("tDir"), s.dirCW ? F("CW") : F("CCW"));
-  Winder::NX::cmd(String(F("cb0Profile.val=")) + s.profileId);
-
-  // If you have a profile dropdown (cb0Profile):
-  Winder::NX::setVal(F("cb0Profile"), s.profileId);
 }
 
 // Push current settings to page0 (+ optional page1) regardless of active page
@@ -257,64 +252,8 @@ static void repaintAllPagesFromSettings()
   }
 }
 
-//=== /HMI PUSH (helpers -> Nextion) ======================================
-//=== LOOP SERVICE ========================================================
-
-//  ====
-
-//=== /LOOP SERVICE ========================================================
-
-// Parser state 
-static String nxBuf; // TODO: review Copilot note about X after v2b-stable
-static uint8_t nxFF = 0;
-static String pendingSetKey; // remembers "SET key" waiting for its value
-
-static long parseIntSafe(const String &s)
-{
-  String d;
-  d.reserve(s.length());
-  for (size_t i = 0; i < s.length(); ++i)
-  { // TODO: review Copilot note about X after v2b-stable
-
-    char c = s[i];
-    if ((c >= '0' && c <= '9') || (c == '-' && d.length() == 0))
-      d += c;
-  }
-  return d.length() ? d.toInt() : 0;
-}
-
-// Keep only printable ASCII + space; drop NULs and control chars
-static void nxSanitize_(String &s)
-{
-  String out;
-  out.reserve(s.length());
-  for (size_t i = 0; i < s.length(); ++i)
-  {
-    unsigned char c = (unsigned char)s[i];
-    if (c == ' ' || (c >= 32 && c <= 126))
-      out += (char)c; // keep printable + space
-  }
-  s = out;
-}
-
-//=== RPM (sim/live) ======================================================
-
-// === PATCH 3A-LITE ===
-// === Simulated Live RPM (until tacho is wired) ===
-static int rpmSim = 0;
-static uint32_t rpmSimLastMs = 0;
-// Helper to push to both pages safely
-static inline void pushRpmToHMI_(int rpm)
-{
-  char buf[12];
-  snprintf(buf, sizeof(buf), "%d", rpm);
-  // Use your existing NX helpers (page-qualified component names are OK)
-  Winder::NX::setTxt(F("page0.tRpm"), buf);
-  Winder::NX::setTxt(F("page1.tRpm"), buf);
-}
-// === /PATCH 3A-LITE ===
-
-static void updateSimRpmAndPush() // Call this periodically to animate live RPM toward the target
+// Call this periodically to animate live RPM toward the target
+static void updateSimRpmAndPush()
 {
   const uint32_t now = millis();
   if (rpmSimLastMs == 0)
@@ -357,26 +296,7 @@ static void updateSimRpmAndPush() // Call this periodically to animate live RPM 
   }
 }
 
-//=== /RPM (sim/live) ======================================================
-//=== NX INPUT (serial -> parser) ========================================
-
-static inline void nxTerm() // TODO: review Copilot note about X after v2b-stable
-{
-  for (int i = 0; i < 3; i++)
-    HMI.write(0xFF);
-}
-
-static void nx(const char *fmt, ...)
-{
-  char buf[128];
-  va_list ap;
-  va_start(ap, fmt);
-  vsnprintf(buf, sizeof(buf), fmt, ap);
-  va_end(ap);
-  HMI.print(buf);
-  nxTerm();
-}
-
+// ---------- full parser ----------
 static void handleNextionMessage(const String &msg)
 {
   String m = msg;
@@ -403,16 +323,6 @@ static void handleNextionMessage(const String &msg)
   if (m == "HB OFF")
   {
     HB_ENABLE = false;
-    return;
-  }
-  if (m == "MSTART")
-  {
-    motorStartSimple();
-    return;
-  }
-  if (m == "MSTOP")
-  {
-    motorStopSimple();
     return;
   }
 
@@ -469,8 +379,6 @@ static void handleNextionMessage(const String &msg)
     return;
   }
 }
-
-//=== NX /INPUT (serial -> parser) ========================================
 
 // Read Nextion bytes, detect 0xFF 0xFF 0xFF terminator, then dispatch
 static void pollHMI()
@@ -534,8 +442,6 @@ static void pollHMI()
   }
 }
 
-//=== SETUP/LOOP =====================================================
-
 void setup()
 {
   // USB serial console
@@ -595,32 +501,6 @@ void setup()
     Winder::NX::cmd(F("page1.btHb.txt=\"HB OFF\""));
   }
 
-  // --- TB6600 + FastAccelStepper init ---
-  engine.init();
-  fas = engine.stepperConnectToPin(PIN_STEP);
-  if (fas)
-  {
-    // EN is active-LOW with common-anode wiring
-    fas->setEnablePin(PIN_EN, /*low_active=*/true);
-    fas->setAutoEnable(true);
-
-    // Direction sense:
-    // 'true' means DIR=HIGH counts UP (positive steps).
-    // We'll align it to your 'dirCW' later; start with true for a first spin.
-    fas->setDirectionPin(PIN_DIR, /*dirHighCountsUp=*/true);
-
-    // TB6600 safe timing
-    fas->setDelayToEnable(3000);       // 3 ms before first step after enable
-    fas->setDelayToDisable(3000);      // 3 ms before disabling after last step
-    //fas->setDelayToDirectionChange(5); // ≥5 µs DIR setup
-
-    // Seed speed/accel from your settings
-    const auto &s = store.get();
-    fas->setSpeedInHz(rpm_to_sps(s.maxRPM));      // steps/s
-    fas->setAcceleration(accel_to_sps2(s.accel)); // steps/s^2
-    fas->setCurrentPosition(0);
-  }
-
   Serial.println(F("Setup complete."));
 }
 
@@ -628,6 +508,13 @@ void loop()
 {
   static uint32_t lastBeat = 0;
   const uint32_t now = millis();
+
+  // Heartbeat every 1s
+  // if (now - lastBeat >= 1000)
+  // {
+  //   lastBeat = now;
+  //   Serial.printf("[HB] %lu ms\n", (unsigned long)now);
+  // }
 
   if (millis() - hbLast >= HB_PERIOD_MS)
   {
@@ -637,6 +524,7 @@ void loop()
   }
 
   updateSimRpmAndPush();
+
   pollHMI();             // this will assemble frames & call handleNextionMessage()
   updateSimRpmAndPush(); // (your other periodic tasks)
 
@@ -708,5 +596,3 @@ void loop()
     }
   }
 }
-
-//=== /SETUP/LOOP =====================================================
