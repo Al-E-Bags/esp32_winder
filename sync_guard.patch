@@ -1,0 +1,89 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 1111111..2222222 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,6 +1,28 @@
+ // (your includes above)
+ 
++// --------------------------------------------------------------------
++// UI sync/guard additions (Phase 2C hardening)
++// --------------------------------------------------------------------
++// Gate parser while setup runs / until initial UI sync finishes
++static volatile bool g_inSetup = true;
++// Run initial HMI sync once from loop()
++static bool g_needInitialSync = true;
++
++// Forward declarations (so loop()/parser can see these)
++static void nxSanitize_(String& s);
++static void syncUIFromSettings();
++static void handleNextionMessage(const String& msg);  // already exists; keep signature
++static void pollHMI();                                // already exists; keep signature
++
+@@ -120,6 +142,14 @@ static void handleNextionMessage(const String &msg)
+ {
++  // Ignore frames during setup / initial repaint to avoid re-entrancy
++  if (g_inSetup) return;
++
++  // Sanitize and trim the message so matching is reliable
++  String m = msg;
++  nxSanitize_(m);
++  m.trim();
++  if (!m.length()) return;
+   // ... your existing command handling continues below ...
+ }
+ 
+@@ -260,10 +290,18 @@ void setup()
+ {
+   Serial.begin(115200);
+   delay(50);
+-  // HMI.begin(...) etc.
++  // HMI UART init (keep your working pins/baud)
++  // Example:
++  // HMI.begin(115200, SERIAL_8N1, HMI_RX, HMI_TX);
++  // Make Nextion quiet before we blast commands later (no return frames)
++  HMI.print(F("bkcmd=0")); HMI.write(0xFF); HMI.write(0xFF); HMI.write(0xFF);
+ 
+   // NVS/settings
+   store.begin();
+   store.load();
+-  syncUIFromSettings();  // (moved to loop() one-shot)
++  // IMPORTANT: do NOT call syncUIFromSettings() here anymore.
++  // It is deferred to the first loop tick for stack safety.
+ }
+ 
+@@ -310,6 +348,18 @@ void loop()
+ {
++  // One-shot initial repaint OUTSIDE setup() for stack safety
++  if (g_needInitialSync) {
++    syncUIFromSettings();
++    g_needInitialSync = false;
++    g_inSetup = false;   // now allow parser traffic
++  }
++
+   pollHMI();
+   // updateSimRpmAndPush(); // if you use the RPM sim
+   heartbeatTick();
+ }
+ 
++// --------------------------------------------------------------------
++// Sanitizer + safe UI sync (low-stack)
++// --------------------------------------------------------------------
++static void nxSanitize_(String& s) {
++  String out; out.reserve(s.length());
++  for (size_t i = 0; i < s.length(); ++i) {
++    unsigned char c = (unsigned char)s[i];
++    if (c == ' ' || (c >= 32 && c <= 126)) out += (char)c;
++  }
++  s = out;
++}
++
++static void syncUIFromSettings() {
++  // Prefer your existing repaint function if present:
++  // repaintAllPagesFromSettings();
++  // If not present in this file revision, this stub is safe to keep;
++  // you can paste the direct nxf_() version later.
++
++  // Defensive: hide any stale toast on both pages
++  HMI.print(F("vis page0.tToast,0")); HMI.write(0xFF); HMI.write(0xFF); HMI.write(0xFF);
++  HMI.print(F("vis page1.tToast,0")); HMI.write(0xFF); HMI.write(0xFF); HMI.write(0xFF);
++}
